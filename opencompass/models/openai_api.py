@@ -499,7 +499,7 @@ class OpenAI(BaseAPIModel):
                 max_tokens=1,
             ).headers
         
-        temp_dir = "TEMPDIR"
+        temp_dir = tempfile.gettempdir()
         requests_file_path = os.path.join(
             temp_dir, "opencompass_requests.jsonl",
         )
