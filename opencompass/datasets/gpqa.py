@@ -2,6 +2,7 @@ import csv
 import os
 import random
 import re
+from typing import Dict
 
 from datasets import Dataset
 
@@ -62,11 +63,10 @@ class GPQAEvaluator(BaseEvaluator):
 
 
 @LOAD_DATASET.register_module()
-class GPQADataset_Simple_Eval(BaseDataset):
+class GPQADataset_Simple_Eval(BaseDataset): 
 
     @staticmethod
-    def load(path: str, name: str):
-        n_repeats = 4
+    def load(path: str, name: str,  n_repeats: int = 4):
         data = []
         with open(os.path.join(path, name), 'r', encoding='utf-8') as f:
             reader = csv.reader(f, delimiter=',')
