@@ -530,7 +530,7 @@ class OpenAI(BaseAPIModel):
                 f.write(json.dumps(data) + "\n")
 
 
-
+        
 
         # *0.75 to leave some headroom
         max_requests_per_minute = float(int(openai_headers.get("x-ratelimit-limit-requests"))  * 0.75)
@@ -557,10 +557,16 @@ class OpenAI(BaseAPIModel):
         
         results = []
 
+        input_toks = 0
+        output_toks = 0
+
         for line in lines:
             response_object = json.loads(line)
             response = response_object[1]["choices"]
             idx = response_object[2]["idx"]
+
+            input_toks += int(response_object[1]["usage"]["prompt_tokens"])
+            output_toks += int(response_object[1]["usage"]["completion_tokens"])
 
             for resp in response:
                 s = resp["message"]["content"]
@@ -569,6 +575,17 @@ class OpenAI(BaseAPIModel):
         results.sort(key=lambda x: x[0])
 
         clean_up_requests()
+
+        cwd = os.getcwd()
+
+        with open("TOKEN_COUNTER.json", "r+") as f:
+            token_counter = json.load(f)
+            total_input_toks = int(token_counter["input_toks"]) + input_toks
+            total_output_toks = int(token_counter["output_toks"]) + output_toks
+            print(total_input_toks, total_output_toks)
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps({"input_toks": total_input_toks, "output_toks": total_output_toks}))
 
         return [s for _, s in results]
 
