@@ -4,6 +4,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Union
 
+import os
+from dotenv import load_dotenv, find_dotenv
+
 import requests
 
 from opencompass.utils.prompt import PromptList
@@ -48,7 +51,19 @@ class Gemini(BaseAPIModel):
                          query_per_second=query_per_second,
                          meta_template=meta_template,
                          retry=retry)
-        self.url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={key}'
+        
+        if isinstance(key, str):
+            if key == "ENV":
+                
+                if 'GOOGLE_API_KEY' not in os.environ:
+                    raise ValueError('Google API key is not set.')
+                self.keys = os.getenv('GOOGLE_API_KEY')
+            else:
+                self.keys = [key]
+        else:
+            self.keys = key
+
+        self.url = f'https://generativelanguage.googleapis.com/v1/models/{path}:generateContent?key={self.keys}'
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -171,17 +186,17 @@ class Gemini(BaseAPIModel):
                                   str(raw_response.content))
                 time.sleep(1)
                 continue
-            if raw_response.status_code == 200 and response['msg'] == 'ok':
-                body = response['body']
-                if 'candidates' not in body:
+            if raw_response.status_code == 200:
+
+                if 'candidates' not in response:
                     self.logger.error(response)
                 else:
-                    if 'content' not in body['candidates'][0]:
+                    if 'content' not in response['candidates'][0]:
                         return "Due to Google's restrictive policies, I am unable to respond to this question."
                     else:
-                        return body['candidates'][0]['content']['parts'][0][
+                        return response['candidates'][0]['content']['parts'][0][
                             'text'].strip()
-            self.logger.error(response['msg'])
+            self.logger.error(response["error"]["message"])
             self.logger.error(response)
             time.sleep(1)
 
