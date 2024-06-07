@@ -222,7 +222,7 @@ class APIRequest:
         status_tracker: StatusTracker,
     ):
         logger = get_logger()
-        """Calls the OpenAI API and saves results."""
+        """Calls the Anthropic API and saves results."""
         logger.info(f"Starting request #{self.task_id}")
         error = None
 
