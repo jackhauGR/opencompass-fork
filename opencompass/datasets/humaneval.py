@@ -100,6 +100,7 @@ class HumanEvaluator(BaseEvaluator):
                                   self.k,
                                   n_workers=4,
                                   timeout=3.0,
+                                  ignore_incomplete=True,
                                   problem_file=self.HUMAN_EVAL)
                 return {f'humaneval_{k}': score[k] * 100 for k in score}
         else:

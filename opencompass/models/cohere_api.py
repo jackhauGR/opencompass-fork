@@ -1,25 +1,33 @@
-import asyncio
+import asyncio  # for running API calls concurrently
 import atexit
+import copy
+import json  # for saving results to a jsonl file
+import os
+from pathlib import Path
+import re  # for matching endpoint from request URL
+import signal
+import tempfile
+import jieba
+import time  # for sleeping after rate limit is hit
+from collections import defaultdict
+from requests import get as get_request
+from opencompass.utils.logging import get_logger
+
+# Openai parallel processor imports
 from dataclasses import (
     dataclass,
     field,
 )
-import json
-from opencompass.utils.logging import get_logger
-import os
-import re
-import signal
-import tempfile
-import time
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-from typing import Dict, List, Optional, Union
 
-import aiohttp
-import jieba
-import openai
-import requests
-import tiktoken
+# for storing API inputs, outputs, and metadata
+from importlib.util import find_spec
+from typing import Dict, List, Literal, Optional, Tuple, Union
+
+import aiohttp  # for making API calls concurrently
+import tiktoken  # for counting tokens
+from tokenizers import Tokenizer
+from tqdm import tqdm
+
 
 from opencompass.registry import MODELS
 from opencompass.utils.prompt import PromptList
@@ -27,9 +35,8 @@ from opencompass.utils.prompt import PromptList
 from .base_api import BaseAPIModel
 
 PromptType = Union[PromptList, str]
-OPENAI_API_BASE = 'https://api.openai.com/v1/chat/completions'
 
-
+COHERE_API_BASE="https://api.cohere.com/v1/chat"
 
 async def process_api_requests_from_file(
     requests_filepath: str,
@@ -38,9 +45,8 @@ async def process_api_requests_from_file(
     api_key: str,
     max_requests_per_minute: float,
     max_tokens_per_minute: float,
-    token_encoding_name: str,
+    tokenizer: Tokenizer,
     max_attempts: int,
-    logging_level: int,
     logger
 ):
     """Processes API requests in parallel, throttling to stay under rate limits."""
@@ -51,11 +57,7 @@ async def process_api_requests_from_file(
     )
 
     # infer API endpoint and construct request header
-    api_endpoint = api_endpoint_from_url(request_url)
     request_header = {"Authorization": f"Bearer {api_key}"}
-    # use api-key header for Azure deployments
-    if "/deployments" in request_url:
-        request_header = {"api-key": f"{api_key}"}
 
     # initialize trackers
     queue_of_requests_to_retry = asyncio.Queue()
@@ -98,7 +100,7 @@ async def process_api_requests_from_file(
                                 task_id=next(task_id_generator),
                                 request_json=request_json,
                                 token_consumption=num_tokens_consumed_from_request(
-                                    request_json, api_endpoint, token_encoding_name
+                                    request_json, tokenizer
                                 ),
                                 attempts_left=max_attempts,
                                 metadata=request_json.pop("metadata", None),
@@ -229,7 +231,8 @@ class APIRequest:
         save_filepath: str,
         status_tracker: StatusTracker,
     ):
-        logger = get_logger()
+        
+        logger = get_logger("INFO")
         """Calls the OpenAI API and saves results."""
         logger.info(f"Starting request #{self.task_id}")
         error = None
@@ -237,14 +240,15 @@ class APIRequest:
             async with session.post(
                 url=request_url, headers=request_header, json=self.request_json
             ) as response:
+                status = response.status
                 response = await response.json()
-            if "error" in response:
+            if status < 200 or status >= 300:
                 logger.warning(
-                    f"Request {self.task_id} failed with error {response['error']}"
+                    f"Request {self.task_id} failed with error code {str(status)}"
                 )
                 status_tracker.num_api_errors += 1
                 error = response
-                if "Rate limit" in response["error"].get("message", ""):
+                if status == 429:
                     status_tracker.time_of_last_rate_limit_error = time.time()
                     status_tracker.num_rate_limit_errors += 1
                     status_tracker.num_api_errors -= (
@@ -285,18 +289,6 @@ class APIRequest:
 
 # functions
 
-
-def api_endpoint_from_url(request_url):
-    """Extract the API endpoint from the request URL."""
-    match = re.search("^https://[^/]+/v\\d+/(.+)$", request_url)
-    if match is None:
-        # for Azure OpenAI deployment urls
-        match = re.search(
-            r"^https://[^/]+/openai/deployments/[^/]+/(.+?)(\?|$)", request_url
-        )
-    return match[1]
-
-
 def append_to_jsonl(data, filename: str) -> None:
     """Append a json payload to the end of a jsonl file."""
     json_string = json.dumps(data)
@@ -306,61 +298,18 @@ def append_to_jsonl(data, filename: str) -> None:
 
 def num_tokens_consumed_from_request(
     request_json: dict,
-    api_endpoint: str,
-    token_encoding_name: str,
+    tokenizer: Tokenizer,
 ):
-    """Count the number of tokens in the request. Only supports completion and embedding requests."""
-    encoding = tiktoken.get_encoding(token_encoding_name)
-    # if completions request, tokens = prompt + n * max_tokens
-    if api_endpoint.endswith("completions"):
-        max_tokens = request_json.get("max_tokens", 15)
-        n = request_json.get("n", 1)
-        completion_tokens = n * max_tokens
+    completion_tokens = request_json.get("max_tokens", 256)
 
-        # chat completions
-        if api_endpoint.startswith("chat/"):
-            num_tokens = 0
-            for message in request_json["messages"]:
-                num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
-                for key, value in message.items():
-                    num_tokens += len(encoding.encode(value))
-                    if key == "name":  # if there's a name, the role is omitted
-                        num_tokens -= 1  # role is always required and always 1 token
-            num_tokens += 2  # every reply is primed with <im_start>assistant
-            return num_tokens + completion_tokens
-        # normal completions
-        else:
-            prompt = request_json["prompt"]
-            if isinstance(prompt, str):  # single prompt
-                prompt_tokens = len(encoding.encode(prompt))
-                num_tokens = prompt_tokens + completion_tokens
-                return num_tokens
-            elif isinstance(prompt, list):  # multiple prompts
-                prompt_tokens = sum([len(encoding.encode(p)) for p in prompt])
-                num_tokens = prompt_tokens + completion_tokens * len(prompt)
-                return num_tokens
-            else:
-                raise TypeError(
-                    'Expecting either string or list of strings for "prompt" field in completion request'
-                )
-    # if embeddings request, tokens = input tokens
-    elif api_endpoint == "embeddings":
-        input = request_json["input"]
-        if isinstance(input, str):  # single input
-            num_tokens = len(encoding.encode(input))
-            return num_tokens
-        elif isinstance(input, list):  # multiple inputs
-            num_tokens = sum([len(encoding.encode(i)) for i in input])
-            return num_tokens
-        else:
-            raise TypeError(
-                'Expecting either string or list of strings for "inputs" field in embedding request'
-            )
-    # more logic needed to support other API calls (e.g., edits, inserts, DALL-E)
-    else:
-        raise NotImplementedError(
-            f'API endpoint "{api_endpoint}" not implemented in this script'
-        )
+    prompt_tokens = 0
+    if history := request_json.get("chat_history"):
+        for message in history:
+            prompt_tokens += len(tokenizer.encode(message["message"], add_special_tokens=False).tokens)
+    
+    prompt_tokens += len(tokenizer.encode(request_json["message"]).tokens)
+
+    return prompt_tokens + completion_tokens
 
 
 def task_id_generator_function():
@@ -370,12 +319,54 @@ def task_id_generator_function():
         yield task_id
         task_id += 1
 
+
+def process_chat_request(messages, model, idx, **kwargs):
+    request = {
+        "message": messages,
+        "model": model,
+        "metadata": {"idx": idx},
+    }
+
+    request.update(kwargs)
+
+    return json.dumps(request)
+
+
+def get_result(response, ctxlen: int) -> Tuple[float, bool]:
+    """Process results from OpenAI API response.
+
+    :param response: dict
+        OpenAI API Response
+    :param ctxlen: int
+        Length of context (so we can slice them away and only keep the predictions)
+    :return:
+        continuation_logprobs: np.array
+            Log probabilities of continuation tokens
+        is_greedy: bool
+            whether argmax matches given continuation exactly
+    """
+    is_greedy = True
+    logprobs = response.logprobs.token_logprobs
+    continuation_logprobs = sum(logprobs[ctxlen:])
+
+    for i in range(ctxlen, len(response.logprobs.token_logprobs)):
+        token = response.logprobs.token_logprobs[i]
+        top_tokens = response.logprobs.top_logprobs[i]
+        top_token = max(top_tokens.keys(), key=lambda x: top_tokens[x])
+        if top_token != token:
+            is_greedy = False
+            break
+
+    return continuation_logprobs, is_greedy
+
+
+
 @MODELS.register_module()
-class OpenAI(BaseAPIModel):
-    """Model wrapper around OpenAI's models.
+class Cohere(BaseAPIModel):
+    """Model wrapper around Cohere's models.
 
     Args:
-        path (str): The name of OpenAI's model.
+        path (str): The name of Cohere's model.
         max_seq_len (int): The maximum allowed sequence length of a model.
             Note that the length of prompt + generated tokens shall not exceed
             this value. Defaults to 2048.
@@ -387,15 +378,11 @@ class OpenAI(BaseAPIModel):
             variable $OPENAI_API_KEY, as how openai defaults to be. If it's a
             list, the keys will be used in round-robin manner. Defaults to
             'ENV'.
-        org (str or List[str], optional): OpenAI organization(s). If not
-            specified, OpenAI uses the default organization bound to each API
-            key. If specified, the orgs will be posted with each request in
-            round-robin manner. Defaults to None.
         meta_template (Dict, optional): The model's meta prompt
             template if needed, in case the requirement of injecting or
             wrapping of any meta instructions.
-        openai_api_base (str): The base url of OpenAI's API. Defaults to
-            'https://api.openai.com/v1/chat/completions'.
+        cohere_api_base (str): The base url of OpenAI's API. Defaults to
+            'https://api.cohere.com/v1/chat'.
         mode (str, optional): The method of input truncation when input length
             exceeds max_seq_len. 'front','mid' and 'rear' represents the part
             of input to truncate. Defaults to 'none'.
@@ -416,14 +403,9 @@ class OpenAI(BaseAPIModel):
                  rpm_verbose: bool = False,
                  retry: int = 2,
                  key: Union[str, List[str]] = 'ENV',
-                 org: Optional[Union[str, List[str]]] = None,
                  meta_template: Optional[Dict] = None,
-                 openai_api_base: str = OPENAI_API_BASE,
                  mode: str = 'none',
-                 logprobs: Optional[bool] = False,
-                 top_logprobs: Optional[int] = None,
-                 temperature: Optional[float] = None,
-                 tokenizer_path: Optional[str] = None):
+                 temperature: Optional[float] = None,):
 
         super().__init__(path=path,
                          max_seq_len=max_seq_len,
@@ -431,72 +413,59 @@ class OpenAI(BaseAPIModel):
                          query_per_second=query_per_second,
                          rpm_verbose=rpm_verbose,
                          retry=retry)
-        import tiktoken
-        self.tiktoken = tiktoken
+
         self.temperature = temperature
         assert mode in ['none', 'front', 'mid', 'rear']
         self.mode = mode
-        self.logprobs = logprobs
-        self.top_logprobs = top_logprobs
-        self.tokenizer_path = tokenizer_path
-        self.client = openai.OpenAI()
 
         if isinstance(key, str):
             if key == 'ENV':
-                if 'OPENAI_API_KEY' not in os.environ:
-                    raise ValueError('OpenAI API key is not set.')
-                self.keys = os.getenv('OPENAI_API_KEY').split(',')
+                if 'COHERE_API_KEY' not in os.environ:
+                    raise ValueError('COHERE API key is not set.')
+                self.keys = os.getenv('COHERE_API_KEY').split(',')
             else:
                 self.keys = [key]
         else:
             self.keys = key
 
-        # record invalid keys and skip them when requesting API
-        # - keys have insufficient_quota
-        self.invalid_keys = set()
-
         self.key_ctr = 0
-        if isinstance(org, str):
-            self.orgs = [org]
-        else:
-            self.orgs = org
-        self.org_ctr = 0
-        self.url = openai_api_base
         self.path = path
 
-    def generate(self,
-                 inputs: List[PromptType],
-                 max_out_len: int = 512,
-                 temperature: float = 0.7,
-                 **kwargs) -> List[str]:
-        """Generate results given a list of inputs.
+        tokenizer_url = ""
 
-        Args:
-            inputs (List[PromptType]): A list of strings or PromptDicts.
-                The PromptDict should be organized in OpenCompass'
-                API format.
-            max_out_len (int): The maximum length of the output.
-            temperature (float): What sampling temperature to use,
-                between 0 and 2. Higher values like 0.8 will make the output
-                more random, while lower values like 0.2 will make it more
-                focused and deterministic. Defaults to 0.7.
-
-        Returns:
-            List[str]: A list of generated strings.
-        """
-
-        if self.temperature is not None:
-            temperature = self.temperature
-
-        openai_headers = self.client.chat.completions.with_raw_response.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "user", "content": "Respond with a full stop only (.):"}
-                ],
-                stop=["."],
-                max_tokens=1,
-            ).headers
+        retry_tokenizer = 5
         
+        while True:
+            model_url = f"https://api.cohere.com/v1/models/{self.path}"
+            if retry_tokenizer == 0:
+                raise ConnectionError(f"Unable to get tokenizer from {model_url}.")
+            model_info = get_request(
+                url=model_url,
+                headers={
+                    "accept": "application/json",
+                    "Authorization": f"BEARER {self.keys[self.key_ctr]}"
+                }
+            )
+            if model_info.status_code == 200:
+                tokenizer_url = model_info.json()["tokenizer_url"]
+                break
+            else:
+                retry_tokenizer -= 1
+
+                time.sleep(5)
+
+
+        tokenizer_config = get_request(tokenizer_url)
+        self.tokenizer: Tokenizer = Tokenizer.from_str(tokenizer_config.text)
+
+    def generate(self,
+                inputs: List[PromptType],
+                max_out_len: int = 512,
+                temperature: float = 0.7):
+        
+        if self.temperature is not None:
+                temperature = self.temperature
+
         temp_dir = tempfile.gettempdir()
         requests_file_path = os.path.join(
             temp_dir, "opencompass_requests.jsonl",
@@ -520,38 +489,32 @@ class OpenAI(BaseAPIModel):
         signal.signal(signal.SIGTERM, clean_up_requests)
 
         with open(requests_file_path, "w") as f:
-            for idx, input in enumerate(inputs):
-                data = self.get_request_data(input=input, max_out_len=max_out_len, temperature=temperature)
+                for idx, input in enumerate(inputs):
+                    data = self.get_request_data(input=input, max_out_len=max_out_len, temperature=temperature)
 
-                data = data | {"metadata": {"idx" : idx} }
+                    data = data | {"metadata": {"idx" : idx} }
 
-                f.write(json.dumps(data) + "\n")
-
-
+                    f.write(json.dumps(data) + "\n")
         
-
-        # *0.75 to leave some headroom
-        max_requests_per_minute = float(int(openai_headers.get("x-ratelimit-limit-requests"))  * 0.75)
-        max_tokens_per_minute   = float(int(openai_headers.get("x-ratelimit-limit-tokens")) * 0.75)
-
+        max_requests_per_minute = 10_000
         asyncio.run(
             process_api_requests_from_file(
                 requests_filepath=str(requests_file_path),
                 save_filepath=str(responses_file_path),
-                request_url=str("https://api.openai.com/v1/chat/completions"),
+                request_url=str("https://api.cohere.com/v1/chat"),
                 api_key=str(self.keys[self.key_ctr]),
-                max_requests_per_minute=max_requests_per_minute,
-                max_tokens_per_minute=max_tokens_per_minute,
-                token_encoding_name="cl100k_base",
-                max_attempts=self.retry,
-                logging_level=int(30),
+                max_requests_per_minute=float(
+                    max_requests_per_minute * 0.75
+                ),  # *0.75 to leave some headroom
+                max_tokens_per_minute=float(2000000),
+                tokenizer=self.tokenizer,
+                max_attempts=10,
                 logger=get_logger('INFO')
             )
         )
 
         with open(responses_file_path, "r") as f:
             lines = f.readlines()
-
         
         results = []
 
@@ -560,15 +523,14 @@ class OpenAI(BaseAPIModel):
 
         for line in lines:
             response_object = json.loads(line)
-            response = response_object[1]["choices"]
+            context = response_object[0]["message"]
+            response = response_object[1]["text"]
             idx = response_object[2]["idx"]
 
-            input_toks += int(response_object[1]["usage"]["prompt_tokens"])
-            output_toks += int(response_object[1]["usage"]["completion_tokens"])
+            input_toks += int(response_object[1]["meta"]["tokens"]["input_tokens"])
+            output_toks += int(response_object[1]["meta"]["tokens"]["output_tokens"])
 
-            for resp in response:
-                s = resp["message"]["content"]
-                results.append((idx, s))
+            results.append((idx, response))
             
         results.sort(key=lambda x: x[0])
 
@@ -587,44 +549,37 @@ class OpenAI(BaseAPIModel):
 
         return [s for _, s in results]
 
-        # with ThreadPoolExecutor() as executor:
-        #     results = list(
-        #         executor.map(self._generate, inputs,
-        #                      [max_out_len] * len(inputs),
-        #                      [temperature] * len(inputs)))
-        # return results
-    
+
+
+
     def get_request_data(self, input: PromptType, max_out_len: int,
-                  temperature: float):
+                    temperature: float):
                 # max num token for gpt-3.5-turbo is 4097
-        context_window = 4096
-        if '32k' in self.path:
-            context_window = 32768
-        elif '16k' in self.path:
-            context_window = 16384
-        elif 'gpt-4' in self.path:
-            context_window = 8192
+        context_window = 128_000
 
         # will leave 100 tokens as prompt buffer, triggered if input is str
         if isinstance(input, str) and self.mode != 'none':
             context_window = self.max_seq_len
             input = self.bin_trim(input, context_window - 100 - max_out_len)
 
-        if isinstance(input, str):
-            messages = [{'role': 'user', 'content': input}]
-        else:
-            messages = []
-            for item in input:
-                msg = {'content': item['prompt']}
-                if item['role'] == 'HUMAN':
-                    msg['role'] = 'user'
-                elif item['role'] == 'BOT':
-                    msg['role'] = 'assistant'
-                elif item['role'] == 'SYSTEM':
-                    msg['role'] = 'system'
-                messages.append(msg)
 
-        # Hold out 100 tokens due to potential errors in tiktoken calculation
+        data = {}
+        if isinstance(input, str):
+            data["message"] = input
+        else:
+            data["message"] = input[-1]['prompt']
+            history = []
+            for item in input[:-1]:
+                msg = {"message": item['prompt']}
+                if item['role'] == 'HUMAN':
+                    msg['role'] = 'USER'
+                elif item['role'] == 'BOT':
+                    msg['role'] = 'CHATBOT'
+                elif item['role'] == 'SYSTEM':
+                    msg['role'] = 'SYSTEM'
+                history.append(msg)
+            data["chat_history"] = history
+
         try:
             max_out_len = min(
                 max_out_len,
@@ -634,111 +589,13 @@ class OpenAI(BaseAPIModel):
         if max_out_len <= 0:
             return ''
 
-        data = dict(
+        data = data | dict(
                     model=self.path,
-                    messages=messages,
                     max_tokens=max_out_len,
-                    n=1,
-                    logprobs=self.logprobs,
-                    top_logprobs=self.top_logprobs,
-                    stop=None,
                     temperature=temperature,
         )
         
         return data
-
-    def _generate(self, input: PromptType, max_out_len: int,
-                  temperature: float) -> str:
-        """Generate results given a list of inputs.
-
-        Args:
-            inputs (PromptType): A string or PromptDict.
-                The PromptDict should be organized in OpenCompass'
-                API format.
-            max_out_len (int): The maximum length of the output.
-            temperature (float): What sampling temperature to use,
-                between 0 and 2. Higher values like 0.8 will make the output
-                more random, while lower values like 0.2 will make it more
-                focused and deterministic.
-
-        Returns:
-            str: The generated string.
-        """
-        assert isinstance(input, (str, PromptList))
-
-        max_num_retries = 0
-
-        key = self.keys[self.key_ctr]
-
-        header = {
-            'Authorization': f'Bearer {key}',
-            'content-type': 'application/json',
-            'api-key': key,
-        }
-
-        data = self.get_request_data(input=input, max_out_len=max_out_len, temperature=temperature)
-
-        if self.orgs:
-            header['OpenAI-Organization'] = self.orgs[self.org_ctr]
-
-        while max_num_retries < self.retry:
-            self.wait()
-
-            try:
-                raw_response = requests.post(self.url,
-                                             headers=header,
-                                             data=json.dumps(data))
-            except requests.ConnectionError:
-                self.logger.error('Got connection error, retrying...')
-                continue
-            try:
-                response = raw_response.json()
-            except requests.JSONDecodeError:
-                self.logger.error('JsonDecode error, got',
-                                  str(raw_response.content))
-                continue
-            self.logger.debug(str(response))
-            try:
-                if self.logprobs:
-                    return response['choices']
-                else:
-                    return response['choices'][0]['message']['content'].strip()
-            except KeyError:
-                if 'error' in response:
-                    if response['error']['code'] == 'rate_limit_exceeded':
-                        time.sleep(10)
-                        self.logger.warn('Rate limit exceeded, retrying...')
-                        continue
-                    elif response['error']['code'] == 'insufficient_quota':
-                        self.invalid_keys.add(key)
-                        self.logger.warn(f'insufficient_quota key: {key}')
-                        continue
-                    elif response['error']['code'] == 'invalid_prompt':
-                        self.logger.warn('Invalid prompt:', str(input))
-                        return ''
-
-                    self.logger.error('Find error message in response: ',
-                                      str(response['error']))
-            max_num_retries += 1
-
-        raise RuntimeError('Calling OpenAI failed after retrying for '
-                           f'{max_num_retries} times. Check the logs for '
-                           'details.')
-
-    def get_token_len(self, prompt: str) -> int:
-        """Get lengths of the tokenized string. Only English and Chinese
-        characters are counted for now. Users are encouraged to override this
-        method if more accurate length is needed.
-
-        Args:
-            prompt (str): Input string.
-
-        Returns:
-            int: Length of the input tokens
-        """
-        enc = self.tiktoken.encoding_for_model(self.path
-                                               or self.tokenizer_path)
-        return len(enc.encode(prompt))
 
     def bin_trim(self, prompt: str, num_token: int) -> str:
         """Get a suffix of prompt which is no longer than num_token tokens.
@@ -783,3 +640,8 @@ class OpenAI(BaseAPIModel):
         elif self.mode == 'rear':
             prompt = sep.join(words[:l])
         return prompt
+    
+    def get_token_len(self, prompt: str) -> int:
+
+        return len(self.tokenizer.encode(prompt).tokens)
+        
