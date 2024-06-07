@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
 from typing import Dict, List, Optional, Union
 
 from opencompass.registry import MODELS
@@ -8,6 +9,20 @@ from ..base_api import BaseAPIModel
 
 PromptType = Union[PromptList, str]
 
+def message_to_dict(message):
+    return {
+        "id": message.id,
+        "content": [{"text": content.text, "type": content.type} for content in message.content],
+        "model": message.model,
+        "role": message.role,
+        "stop_reason": message.stop_reason,
+        "stop_sequence": message.stop_sequence,
+        "type": message.type,
+        "usage": {
+            "input_tokens": message.usage.input_tokens,
+            "output_tokens": message.usage.output_tokens
+        }
+    }
 
 @MODELS.register_module()
 class Claude(BaseAPIModel):
@@ -45,7 +60,17 @@ class Claude(BaseAPIModel):
             raise ImportError('Import anthropic failed. Please install it '
                               'with "pip install anthropic" and try again.')
 
-        self.anthropic = Anthropic(api_key=key)
+        if isinstance(key, str):
+            if key == "ENV":
+                if "ANTHROPIC_API_KEY" not in os.environ:
+                    raise ValueError("Anthropic API Key is not set.")
+                self.key = os.getenv("ANTHROPIC_API_KEY")
+            else:
+                self.key = key
+        else:
+            self.key = key
+
+        self.anthropic = Anthropic(api_key=self.key)
         self.model = path
         self.human_prompt = HUMAN_PROMPT
         self.ai_prompt = AI_PROMPT
@@ -91,28 +116,37 @@ class Claude(BaseAPIModel):
         assert isinstance(input, (str, PromptList))
 
         if isinstance(input, str):
-            messages = f'{self.human_prompt} {input}{self.ai_prompt}'
+            messages = [
+                {"role": "user", "content": input}
+            ]
+            # messages = f'{self.human_prompt} {input}{self.ai_prompt}'
         else:
-            messages = ''
+            prompt = ''
             for item in input:
                 if item['role'] == 'HUMAN' or item['role'] == 'SYSTEM':
-                    messages += f'{self.human_prompt} {item["prompt"]}'
+                    messages += f'{item["prompt"]}'
                 elif item['role'] == 'BOT':
-                    messages += f'{self.ai_prompt} {item["prompt"]}'
-            if not messages.endswith(self.ai_prompt):
-                messages += self.ai_prompt
+                    messages += f'{item["prompt"]}'
+
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+
 
         num_retries = 0
         while num_retries < self.retry:
             self.wait()
             try:
-                completion = self.anthropic.completions.create(
+                response = self.anthropic.messages.create(
                     model=self.model,
-                    max_tokens_to_sample=max_out_len,
-                    prompt=messages)
-                return completion.completion
+                    max_tokens=max_out_len,
+                    temperature=1,
+                    messages=messages)
+
+                return message_to_dict(response)
             except Exception as e:
                 self.logger.error(e)
             num_retries += 1
         raise RuntimeError('Calling Claude API failed after retrying for '
                            f'{self.retry} times. Check the logs for details.')
+
