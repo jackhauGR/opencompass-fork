@@ -232,7 +232,7 @@ class APIRequest:
 
     async def call_api(
         self,
-        session: Anthropic,
+        session: aiohttp.ClientSession,
         request_url: str,
         request_header: dict,
         retry_queue: asyncio.Queue,
