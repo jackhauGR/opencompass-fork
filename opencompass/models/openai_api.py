@@ -489,7 +489,7 @@ class OpenAI(BaseAPIModel):
             temperature = self.temperature
 
         openai_headers = self.client.chat.completions.with_raw_response.create(
-                model="gpt-3.5-turbo",
+                model=self.path,
                 messages=[
                     {"role": "user", "content": "Respond with a full stop only (.):"}
                 ],
